@@ -1,0 +1,19 @@
+[
+  {
+    "id": "user_ff22a737beb8475a87",
+    "username": "admin",
+    "passwordHash": "$2a$10$qoKFzo.0LOoeMrrSQEWa0.lYA9BfsgKqeraDHSzLVK5RaYToRJP5e",
+    "role": "admin",
+    "status": "ALIVE",
+    "canBypassDeath": true,
+    "walletAddress": "",
+    "deviceIds": [
+      "dev_zktdjfk9t6"
+    ],
+    "ownedCards": [],
+    "wins": 0,
+    "deaths": 0,
+    "createdAt": 1772368878676,
+    "lastSeenAt": 1772421860499
+  }
+]

@@ -6,47 +6,67 @@ const jwt = require('jsonwebtoken');
 const http = require('http');
 const { Server } = require('socket.io');
 
-const { createId, sha256, now } = require('./lib/helpers');
+const config = require('./lib/config');
+const { createId, now, sha256 } = require('./lib/helpers');
+const storage = require('./lib/storage/repository');
 const {
-  bootstrapAdmin,
-  getUserById,
-  getUserByUsername,
-  createUser,
-  touchUser,
-  deathLockReason,
-  markDead,
-  awardCard,
-  leaderboard,
-  resetUserDeath,
-} = require('./lib/storage');
-const { createSession, getView, submit, tick } = require('./lib/engines');
+  createSession,
+  getView,
+  submit,
+  submitInput,
+  tick,
+  autoSubmitBots,
+  adminSkip,
+} = require('./lib/engines');
+const { takeRateLimit } = require('./lib/services/rateLimit');
+const {
+  nextRoomVersion,
+  storeRoomEvent,
+  getRoomEventsSince,
+  bindUserRoom,
+  unbindUserRoom,
+  getUserRoom,
+} = require('./lib/services/roomStateStore');
+const { initChainQueue, enqueueDeathRecord } = require('./lib/services/chainQueue');
+const {
+  createNonceMessage,
+  verifySignature,
+  verifySiweSignature,
+} = require('./lib/services/siweService');
 
-const PORT = process.env.PORT || 3100;
-const JWT_SECRET = process.env.JWT_SECRET || 'borderland-local-secret';
+const PORT = config.port;
+const JWT_SECRET = config.jwtSecret;
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
+const io = new Server(server, {
+  cors: { origin: true, credentials: true },
+});
 
-const gamesCatalog = JSON.parse(fs.readFileSync(path.join(__dirname, 'shared', 'gameCatalog.json'), 'utf-8'));
-const rulebookMarkdown = fs.readFileSync(path.join(__dirname, 'docs', 'GAME_RULEBOOK.md'), 'utf-8');
-
-bootstrapAdmin();
-
-app.use(express.json({ limit: '1mb' }));
-app.use(express.static(path.join(__dirname, 'public')));
+const gamesCatalog = JSON.parse(
+  fs.readFileSync(path.join(__dirname, 'shared', 'gameCatalog.json'), 'utf8')
+);
+const rulebookMarkdown = fs.readFileSync(
+  path.join(__dirname, 'docs', 'GAME_RULEBOOK.md'),
+  'utf8'
+);
 
 const rooms = new Map();
 const userRoomIndex = new Map();
 const socketContext = new Map();
+let ticking = false;
 
 function signToken(user) {
-  return jwt.sign({ sub: user.id, role: user.role, username: user.username }, JWT_SECRET, { expiresIn: '7d' });
+  return jwt.sign(
+    { sub: user.id, role: user.role, username: user.username },
+    JWT_SECRET,
+    { expiresIn: '7d' }
+  );
 }
 
 function verifyToken(token) {
   try {
     return jwt.verify(token, JWT_SECRET);
-  } catch (error) {
+  } catch (_error) {
     return null;
   }
 }
@@ -56,37 +76,36 @@ function findGame(cardCode) {
 }
 
 function hashIp(reqOrSocket) {
-  const raw = reqOrSocket.headers?.['x-forwarded-for']
-    || reqOrSocket.handshake?.headers?.['x-forwarded-for']
-    || reqOrSocket.socket?.remoteAddress
-    || reqOrSocket.handshake?.address
-    || '';
-  return raw ? sha256(raw) : '';
+  const raw =
+    reqOrSocket.headers?.['x-forwarded-for'] ||
+    reqOrSocket.handshake?.headers?.['x-forwarded-for'] ||
+    reqOrSocket.socket?.remoteAddress ||
+    reqOrSocket.handshake?.address ||
+    '';
+  return raw ? sha256(String(raw)) : '';
 }
 
-function makeFingerprint({ ipHash, deviceId, userAgent, walletAddress }) {
-  return sha256([ipHash, deviceId || '', userAgent || '', walletAddress || ''].join('|'));
-}
-
-function authMiddleware(req, res, next) {
-  const authHeader = req.headers.authorization || '';
-  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
-  const payload = verifyToken(token);
-  if (!payload) return res.status(401).json({ error: '인증이 필요합니다.' });
-  const user = getUserById(payload.sub);
-  if (!user) return res.status(401).json({ error: '사용자를 찾을 수 없습니다.' });
-  req.user = user;
-  next();
+function sanitizeUser(user) {
+  return {
+    id: user.id,
+    username: user.username,
+    role: user.role,
+    status: user.status,
+    canBypassDeath: !!user.canBypassDeath,
+    ownedCards: user.ownedCards || [],
+  };
 }
 
 function roomSummary(room) {
+  const card = findGame(room.cardCode);
   return {
     id: room.id,
     name: room.name,
     hostId: room.hostId,
     cardCode: room.cardCode,
-    cardName: findGame(room.cardCode)?.name,
+    cardName: card.name,
     status: room.status,
+    version: room.version || 0,
     players: room.players.map((player) => ({
       id: player.id,
       username: player.username,
@@ -94,8 +113,8 @@ function roomSummary(room) {
       isBot: !!player.isBot,
       connected: !!player.connected,
     })),
-    minPlayers: findGame(room.cardCode).players.min,
-    maxPlayers: findGame(room.cardCode).players.max,
+    minPlayers: card.players.min,
+    maxPlayers: card.players.max,
   };
 }
 
@@ -108,6 +127,7 @@ function buildRoomSnapshot(room, viewerId) {
     cardCode: room.cardCode,
     card: findGame(room.cardCode),
     status: room.status,
+    version: room.version || 0,
     players: room.players.map((player) => ({
       id: player.id,
       username: player.username,
@@ -118,57 +138,101 @@ function buildRoomSnapshot(room, viewerId) {
     })),
     chat: room.chat.slice(-50),
     session: sessionView,
+    serverNow: now(),
+    deadlineAt: sessionView?.deadlineAt || null,
   };
 }
 
-function emitRooms() {
+function buildRoomPatch(room) {
+  return {
+    status: room.status,
+    players: room.players.map((player) => ({
+      id: player.id,
+      username: player.username,
+      ready: !!player.ready,
+      alive: player.alive !== false,
+      connected: !!player.connected,
+      isBot: !!player.isBot,
+    })),
+    chat: room.chat.slice(-20),
+    session: room.session
+      ? {
+          phase: room.session.phase,
+          phaseId: room.session.phaseId,
+          status: room.session.status,
+          round: room.session.round,
+          deadlineAt: room.session.deadline,
+          result: room.session.result || null,
+        }
+      : null,
+  };
+}
+
+async function emitRooms() {
   io.emit('rooms:update', Array.from(rooms.values()).map(roomSummary));
 }
 
-function emitRoom(room) {
+async function emitRoom(room) {
+  const previousVersion = room.version || 0;
+  room.version = await nextRoomVersion(room.id);
+  const patch = buildRoomPatch(room);
+  await storeRoomEvent(room.id, room.version, patch);
+
   room.players.forEach((player) => {
-    if (player.socketId) {
-      io.to(player.socketId).emit('room:update', buildRoomSnapshot(room, player.id));
+    if (!player.socketId) return;
+    const snapshot = buildRoomSnapshot(room, player.id);
+    io.to(player.socketId).emit('room:update', {
+      ...snapshot,
+      version: room.version,
+      phaseId: snapshot.session?.phaseId || 0,
+      serverNow: now(),
+      deadlineAt: snapshot.session?.deadlineAt || null,
+    });
+    if (previousVersion > 0 && room.version > previousVersion) {
+      io.to(player.socketId).emit('room:delta', {
+        fromVersion: previousVersion,
+        toVersion: room.version,
+        patch,
+      });
     }
   });
-  emitRooms();
+  await emitRooms();
 }
 
 function addSystemMessage(room, text) {
-  room.chat.push({ id: createId('msg'), user: 'SYSTEM', text, at: now(), system: true });
+  room.chat.push({
+    id: createId('msg'),
+    user: 'SYSTEM',
+    text,
+    at: now(),
+    system: true,
+  });
   if (room.chat.length > 200) room.chat.shift();
 }
 
-function createRoom({ owner, cardCode, name, addBots = 0 }) {
+async function checkRateLimit(scope, id, limit, windowMs) {
+  const result = await takeRateLimit(scope, id, limit, windowMs);
+  if (!result.allowed) throw new Error('rate limited');
+}
+
+async function authMiddleware(req, res, next) {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    const payload = verifyToken(token);
+    if (!payload) return res.status(401).json({ error: 'auth required' });
+    const user = await storage.getUserById(payload.sub);
+    if (!user) return res.status(401).json({ error: 'user not found' });
+    req.user = user;
+    return next();
+  } catch (error) {
+    return res.status(401).json({ error: error.message || 'auth failed' });
+  }
+}
+
+function clampBots(count, cardCode) {
   const game = findGame(cardCode);
-  const room = {
-    id: createId('room'),
-    name: name || `${game.code} - ${game.name}`,
-    hostId: owner.id,
-    cardCode: game.code,
-    status: 'waiting',
-    players: [{
-      id: owner.id,
-      username: owner.username,
-      socketId: owner.socketId,
-      ready: false,
-      alive: true,
-      isBot: false,
-      connected: true,
-      ipHash: owner.ipHash,
-      fingerprint: owner.fingerprint,
-      walletAddress: owner.walletAddress || '',
-    }],
-    chat: [],
-    session: null,
-    processedResult: false,
-  };
-  rooms.set(room.id, room);
-  userRoomIndex.set(owner.id, room.id);
-  if (addBots > 0) fillBots(room, addBots);
-  addSystemMessage(room, `${owner.username} 님이 방을 만들었습니다.`);
-  emitRoom(room);
-  return room;
+  return Math.max(0, Math.min(parseInt(count, 10) || 0, game.players.max));
 }
 
 function fillBots(room, desiredCount) {
@@ -183,41 +247,73 @@ function fillBots(room, desiredCount) {
       alive: true,
       isBot: true,
       connected: true,
-      ipHash: '',
-      fingerprint: '',
-      walletAddress: '',
     });
   }
 }
 
-function removeUserFromRoom(userId) {
-  const roomId = userRoomIndex.get(userId);
-  if (!roomId) return;
-  const room = rooms.get(roomId);
-  if (!room) {
-    userRoomIndex.delete(userId);
-    return;
-  }
-  room.players = room.players.filter((player) => player.id !== userId);
-  userRoomIndex.delete(userId);
-  addSystemMessage(room, `${userId} 퇴장`);
-  if (!room.players.length) {
-    rooms.delete(room.id);
-  } else {
-    if (room.hostId === userId) room.hostId = room.players[0].id;
-    emitRoom(room);
-  }
+async function createRoom({ owner, cardCode, name, addBots = 0 }) {
+  const game = findGame(cardCode);
+  const room = {
+    id: createId('room'),
+    name: name || `${game.code} - ${game.name}`,
+    hostId: owner.id,
+    cardCode: game.code,
+    status: 'waiting',
+    version: 0,
+    players: [
+      {
+        id: owner.id,
+        username: owner.username,
+        socketId: owner.socketId,
+        ready: false,
+        alive: true,
+        isBot: false,
+        connected: true,
+      },
+    ],
+    chat: [],
+    session: null,
+    processedResult: false,
+  };
+  rooms.set(room.id, room);
+  userRoomIndex.set(owner.id, room.id);
+  await bindUserRoom(owner.id, room.id);
+  if (addBots > 0) fillBots(room, addBots);
+  addSystemMessage(room, `${owner.username} created the room.`);
+  await emitRoom(room);
+  return room;
 }
 
-function joinRoom(roomId, ctx) {
+async function removeUserFromRoom(userId) {
+  const roomId = userRoomIndex.get(userId) || (await getUserRoom(userId));
+  if (!roomId) return;
   const room = rooms.get(roomId);
-  if (!room) throw new Error('방이 존재하지 않습니다.');
-  if (userRoomIndex.has(ctx.user.id)) {
-    const currentRoomId = userRoomIndex.get(ctx.user.id);
-    if (currentRoomId !== roomId) removeUserFromRoom(ctx.user.id);
+  userRoomIndex.delete(userId);
+  await unbindUserRoom(userId);
+  if (!room) return;
+
+  room.players = room.players.filter((player) => player.id !== userId);
+  addSystemMessage(room, `${userId} left`);
+  if (!room.players.length) {
+    rooms.delete(room.id);
+    return;
   }
+  if (room.hostId === userId) room.hostId = room.players[0].id;
+  await emitRoom(room);
+}
+
+async function joinRoom(roomId, ctx) {
+  const room = rooms.get(roomId);
+  if (!room) throw new Error('room not found');
+
+  const currentRoomId = userRoomIndex.get(ctx.user.id) || (await getUserRoom(ctx.user.id));
+  if (currentRoomId && currentRoomId !== roomId) {
+    await removeUserFromRoom(ctx.user.id);
+  }
+
   const game = findGame(room.cardCode);
-  if (room.players.length >= game.players.max) throw new Error('방이 가득 찼습니다.');
+  if (room.players.length >= game.players.max) throw new Error('room is full');
+
   let player = room.players.find((item) => item.id === ctx.user.id);
   if (!player) {
     player = {
@@ -228,180 +324,299 @@ function joinRoom(roomId, ctx) {
       alive: true,
       isBot: false,
       connected: true,
-      ipHash: ctx.ipHash,
-      fingerprint: ctx.fingerprint,
-      walletAddress: ctx.user.walletAddress || '',
     };
     room.players.push(player);
-    addSystemMessage(room, `${ctx.user.username} 입장`);
+    addSystemMessage(room, `${ctx.user.username} joined.`);
   } else {
     player.socketId = ctx.socket.id;
     player.connected = true;
   }
+
   userRoomIndex.set(ctx.user.id, room.id);
-  emitRoom(room);
+  await bindUserRoom(ctx.user.id, room.id);
+  await emitRoom(room);
   return room;
 }
 
 function updateRoomPlayerSocket(room, userId, socketId, connected) {
   const player = room.players.find((p) => p.id === userId);
-  if (player) {
-    player.socketId = socketId;
-    player.connected = connected;
-  }
+  if (!player) return;
+  player.socketId = socketId;
+  player.connected = connected;
 }
 
 function canStartRoom(room, requesterId) {
-  if (room.hostId !== requesterId) return '방장만 시작할 수 있습니다.';
+  if (room.hostId !== requesterId) return 'only host can start';
   const game = findGame(room.cardCode);
-  if (room.players.length < game.players.min) return `최소 ${game.players.min}명이 필요합니다.`;
-  const notReady = room.players.filter((player) => !player.isBot && !player.ready && player.id !== requesterId);
-  if (notReady.length) return '모든 플레이어가 준비 상태여야 합니다.';
+  if (room.players.length < game.players.min) return `need at least ${game.players.min} players`;
+  const notReady = room.players.filter(
+    (player) => !player.isBot && !player.ready && player.id !== requesterId
+  );
+  if (notReady.length) return 'all players must be ready';
   return null;
 }
 
-function startRoom(room) {
+async function startRoom(room) {
   const game = findGame(room.cardCode);
   room.status = 'running';
-  room.players.forEach((player) => { player.ready = false; player.alive = true; });
-  room.session = createSession(game, room.players.map((player) => ({
-    id: player.id,
-    username: player.username,
-    isBot: player.isBot,
-  })));
+  room.players.forEach((player) => {
+    player.ready = false;
+    player.alive = true;
+  });
+  room.session = createSession(
+    game,
+    room.players.map((player) => ({
+      id: player.id,
+      username: player.username,
+      isBot: player.isBot,
+    }))
+  );
   room.processedResult = false;
-  addSystemMessage(room, `${game.code} ${game.name} 시작`);
-  emitRoom(room);
+  addSystemMessage(room, `${game.code} ${game.name} started.`);
+  autoSubmitBots(room.session);
+  await emitRoom(room);
 }
 
-function processRoomResult(room) {
+async function processRoomResult(room) {
   if (!room.session || room.session.status !== 'complete' || room.processedResult) return;
   const winners = room.session.result?.winners || [];
-  room.players.forEach((player) => {
-    if (player.isBot) return;
-    const user = getUserById(player.id);
-    if (!user) return;
+  const losers = room.session.players
+    ? room.session.players.map((p) => p.id).filter((id) => !winners.includes(id))
+    : room.players.map((p) => p.id).filter((id) => !winners.includes(id));
+
+  for (const player of room.players) {
+    if (player.isBot) continue;
+    const user = await storage.getUserById(player.id);
+    if (!user) continue;
     if (winners.includes(player.id)) {
-      awardCard(user, room.cardCode);
+      await storage.awardCard(user, room.cardCode);
     } else {
-      markDead(user, {
+      const { record } = await storage.markDead(user, {
         cardCode: room.cardCode,
-        ipHash: player.ipHash,
-        fingerprint: player.fingerprint,
-        walletAddress: player.walletAddress,
         roomId: room.id,
+        walletAddress: user.walletAddress || '',
+        reason: 'ELIMINATED',
       });
-      if (player.socketId) io.to(player.socketId).emit('auth:dead', { reason: `${room.cardCode} 탈락` });
+      if (record) {
+        enqueueDeathRecord(record).catch(() => {});
+        if (player.socketId) {
+          io.to(player.socketId).emit('auth:dead', {
+            reason: 'ACCOUNT_DEAD',
+            deathId: record.id,
+          });
+        }
+      }
     }
+  }
+
+  await storage.recordGameHistory({
+    roomId: room.id,
+    cardCode: room.cardCode,
+    winners,
+    losers,
+    summary: room.session.result?.summary || '',
   });
+
   room.status = 'finished';
   room.processedResult = true;
-  addSystemMessage(room, room.session.result.summary);
-  emitRoom(room);
+  addSystemMessage(room, room.session.result?.summary || 'game finished');
+  await emitRoom(room);
 }
 
-app.post('/api/register', (req, res) => {
+async function handleRegister(req, res) {
   try {
-    const { username, password, deviceId, walletAddress } = req.body || {};
+    await checkRateLimit('register', hashIp(req) || 'anon', 12, 10 * 60 * 1000);
+    const { username, password } = req.body || {};
     if (!username || !password || password.length < 4) {
-      return res.status(400).json({ error: '아이디와 비밀번호를 확인해주세요.' });
+      return res.status(400).json({ error: 'username/password invalid' });
     }
-    const ipHash = hashIp(req);
-    const fingerprint = makeFingerprint({
-      ipHash,
-      deviceId,
-      userAgent: req.headers['user-agent'],
-      walletAddress,
-    });
-    const lock = deathLockReason({ username, walletAddress, ipHash, fingerprint });
-    if (lock) return res.status(403).json({ error: lock });
-    const user = createUser({ username, password, walletAddress, deviceId });
+    const lock = await storage.deathLockReason({ username });
+    if (lock) return res.status(403).json({ error: lock, deathLockReason: lock });
+
+    const user = await storage.createUser({ username, password });
     const token = signToken(user);
-    res.json({ token, user: { username: user.username, role: user.role, status: user.status } });
+    return res.json({ token, user: sanitizeUser(user) });
   } catch (error) {
-    res.status(400).json({ error: error.message || '회원가입 실패' });
+    return res.status(400).json({ error: error.message || 'register failed' });
+  }
+}
+
+async function handleLogin(req, res) {
+  try {
+    await checkRateLimit('login', hashIp(req) || 'anon', 30, 10 * 60 * 1000);
+    const { username, password } = req.body || {};
+    const user = await storage.getUserByUsername(username);
+    if (!user || !bcrypt.compareSync(password || '', user.passwordHash || '')) {
+      return res.status(401).json({ error: 'invalid credentials' });
+    }
+
+    const lock = !user.canBypassDeath
+      ? await storage.deathLockReason({ username: user.username, userId: user.id })
+      : null;
+    if (lock) return res.status(403).json({ error: lock, deathLockReason: lock });
+    if (user.status === 'DEAD' && !user.canBypassDeath) {
+      return res.status(403).json({ error: 'ACCOUNT_DEAD', deathLockReason: 'ACCOUNT_DEAD' });
+    }
+
+    const updated = await storage.touchUser(user, req.body?.deviceId);
+    const token = signToken(updated);
+    return res.json({ token, user: sanitizeUser(updated) });
+  } catch (error) {
+    return res.status(400).json({ error: error.message || 'login failed' });
+  }
+}
+
+app.use(express.json({ limit: '1mb' }));
+app.use(express.static(path.join(__dirname, 'public')));
+
+app.post('/api/auth/register', handleRegister);
+app.post('/api/register', handleRegister);
+app.post('/api/auth/login', handleLogin);
+app.post('/api/login', handleLogin);
+
+app.post('/api/auth/siwe/nonce', async (req, res) => {
+  try {
+    await checkRateLimit('siwe-nonce', hashIp(req) || 'anon', 40, 10 * 60 * 1000);
+    const { walletAddress, chainId } = req.body || {};
+    const domain = req.headers.host || 'localhost';
+    const uri = `${req.protocol}://${req.headers.host || 'localhost'}`;
+    const payload = await createNonceMessage({ walletAddress, chainId, domain, uri });
+    return res.json(payload);
+  } catch (error) {
+    return res.status(400).json({ error: error.message || 'siwe nonce failed' });
   }
 });
 
-app.post('/api/login', (req, res) => {
-  const { username, password, deviceId, walletAddress } = req.body || {};
-  const user = getUserByUsername(username);
-  if (!user || !bcrypt.compareSync(password || '', user.passwordHash || '')) {
-    return res.status(401).json({ error: '로그인 정보가 올바르지 않습니다.' });
+app.post('/api/auth/siwe/verify', async (req, res) => {
+  try {
+    await checkRateLimit('siwe-verify', hashIp(req) || 'anon', 40, 10 * 60 * 1000);
+    const { message, signature, walletAddress } = req.body || {};
+    const { user } = await verifySignature({ message, signature, walletAddress });
+    const lock = !user.canBypassDeath
+      ? await storage.deathLockReason({ username: user.username, userId: user.id })
+      : null;
+    if (lock) return res.status(403).json({ error: lock, deathLockReason: lock });
+    const token = signToken(user);
+    return res.json({ token, user: sanitizeUser(user), walletLinked: true });
+  } catch (error) {
+    return res.status(400).json({ error: error.message || 'siwe verify failed' });
   }
-  const ipHash = hashIp(req);
-  const fingerprint = makeFingerprint({
-    ipHash,
-    deviceId,
-    userAgent: req.headers['user-agent'],
-    walletAddress: walletAddress || user.walletAddress,
-  });
-  const lock = !user.canBypassDeath ? deathLockReason({ username, walletAddress: walletAddress || user.walletAddress, ipHash, fingerprint }) : null;
-  if (lock) return res.status(403).json({ error: lock });
-  if (user.status === 'DEAD' && !user.canBypassDeath) {
-    return res.status(403).json({ error: '이 계정은 사망 처리되었습니다.' });
-  }
-  const updated = touchUser(user, deviceId);
-  const token = signToken(updated);
-  res.json({
-    token,
-    user: { id: updated.id, username: updated.username, role: updated.role, status: updated.status, canBypassDeath: !!updated.canBypassDeath },
-  });
 });
 
-app.get('/api/bootstrap', authMiddleware, (req, res) => {
-  const user = req.user;
-  res.json({
-    user: {
-      id: user.id,
-      username: user.username,
-      role: user.role,
-      status: user.status,
-      canBypassDeath: !!user.canBypassDeath,
-      ownedCards: user.ownedCards || [],
-    },
-    games: gamesCatalog,
-    rooms: Array.from(rooms.values()).map(roomSummary),
-    leaderboard: leaderboard(gamesCatalog),
-    rulebookMarkdown,
-  });
+app.post('/api/auth/wallet/link/nonce', authMiddleware, async (req, res) => {
+  try {
+    const { walletAddress, chainId } = req.body || {};
+    const domain = req.headers.host || 'localhost';
+    const uri = `${req.protocol}://${req.headers.host || 'localhost'}`;
+    const payload = await createNonceMessage({ walletAddress, chainId, domain, uri });
+    return res.json({ nonce: payload.nonce, message: payload.message });
+  } catch (error) {
+    return res.status(400).json({ error: error.message || 'wallet link nonce failed' });
+  }
+});
+
+app.post('/api/auth/wallet/link/verify', authMiddleware, async (req, res) => {
+  try {
+    const { message, signature } = req.body || {};
+    const verified = await verifySiweSignature({ message, signature });
+    const existing = await storage.getUserByWallet(verified.walletAddress, verified.chainId);
+    if (existing && existing.id !== req.user.id) {
+      return res.status(409).json({ error: 'wallet already linked' });
+    }
+    await storage.linkWallet(req.user.id, verified.walletAddress, verified.chainId, true);
+    return res.json({ ok: true, walletAddress: verified.walletAddress });
+  } catch (error) {
+    return res.status(400).json({ error: error.message || 'wallet link verify failed' });
+  }
+});
+
+app.get('/api/bootstrap', authMiddleware, async (req, res) => {
+  try {
+    const user = await storage.getUserById(req.user.id);
+    const board = await storage.leaderboard(gamesCatalog);
+    return res.json({
+      user: sanitizeUser(user),
+      games: gamesCatalog,
+      rooms: Array.from(rooms.values()).map(roomSummary),
+      leaderboard: board,
+      rulebookMarkdown,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'bootstrap failed' });
+  }
 });
 
 app.get('/api/games', (_req, res) => res.json(gamesCatalog));
-app.get('/api/leaderboard', (_req, res) => res.json(leaderboard(gamesCatalog)));
 
-app.post('/api/admin/reset-user', authMiddleware, (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: '어드민 전용입니다.' });
-  const { username } = req.body || {};
-  const user = resetUserDeath(username);
-  if (!user) return res.status(404).json({ error: '사용자를 찾을 수 없습니다.' });
-  res.json({ ok: true, user: { username: user.username, status: user.status } });
+app.get('/api/leaderboard', async (_req, res) => {
+  try {
+    const board = await storage.leaderboard(gamesCatalog);
+    return res.json(board);
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'leaderboard failed' });
+  }
 });
 
-io.use((socket, next) => {
-  const token = socket.handshake.auth?.token;
-  const deviceId = socket.handshake.auth?.deviceId;
-  const payload = verifyToken(token);
-  if (!payload) return next(new Error('auth required'));
-  const user = getUserById(payload.sub);
-  if (!user) return next(new Error('user not found'));
-  const ipHash = hashIp(socket);
-  const fingerprint = makeFingerprint({
-    ipHash,
-    deviceId,
-    userAgent: socket.handshake.headers['user-agent'],
-    walletAddress: user.walletAddress,
-  });
-  const lock = !user.canBypassDeath ? deathLockReason({ username: user.username, walletAddress: user.walletAddress, ipHash, fingerprint }) : null;
-  if (lock) return next(new Error(lock));
-  socketContext.set(socket.id, {
-    socket,
-    user,
-    deviceId,
-    ipHash,
-    fingerprint,
-  });
-  next();
+app.get('/api/rooms/:id/state', authMiddleware, async (req, res) => {
+  try {
+    const room = rooms.get(req.params.id);
+    if (!room) return res.status(404).json({ error: 'room not found' });
+    const inRoom = room.players.some((player) => player.id === req.user.id);
+    if (!inRoom) return res.status(403).json({ error: 'not in room' });
+
+    const sinceVersion = Math.max(0, parseInt(req.query.sinceVersion, 10) || 0);
+    if (sinceVersion > 0 && sinceVersion < (room.version || 0)) {
+      const events = await getRoomEventsSince(room.id, sinceVersion);
+      if (events.length > 0) {
+        return res.json({
+          delta: events.map((event) => ({
+            version: event.version,
+            patch: event.snapshot,
+          })),
+          version: room.version,
+        });
+      }
+    }
+
+    return res.json({
+      snapshot: buildRoomSnapshot(room, req.user.id),
+      version: room.version || 0,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'state fetch failed' });
+  }
+});
+
+app.post('/api/admin/reset-user', authMiddleware, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'admin only' });
+  const { username } = req.body || {};
+  const user = await storage.resetUserDeath(username);
+  if (!user) return res.status(404).json({ error: 'user not found' });
+  return res.json({ ok: true, user: sanitizeUser(user) });
+});
+
+io.use(async (socket, next) => {
+  try {
+    const token = socket.handshake.auth?.token;
+    const payload = verifyToken(token);
+    if (!payload) return next(new Error('auth required'));
+    const user = await storage.getUserById(payload.sub);
+    if (!user) return next(new Error('user not found'));
+
+    const lock = !user.canBypassDeath
+      ? await storage.deathLockReason({ username: user.username, userId: user.id })
+      : null;
+    if (lock) return next(new Error(lock));
+
+    socketContext.set(socket.id, {
+      socket,
+      user,
+      ipHash: hashIp(socket),
+    });
+    return next();
+  } catch (error) {
+    return next(new Error(error.message || 'auth failed'));
+  }
 });
 
 io.on('connection', (socket) => {
@@ -412,17 +627,19 @@ io.on('connection', (socket) => {
   }
 
   socket.emit('rooms:update', Array.from(rooms.values()).map(roomSummary));
+  socket.emit('sync:clock', { serverNow: now(), recvAt: now() });
 
-  socket.on('room:create', (payload = {}, ack = () => {}) => {
+  socket.on('room:create', async (payload = {}, ack = () => {}) => {
     try {
-      const room = createRoom({
+      await checkRateLimit('room-create', ctx.user.id, 15, 60 * 1000);
+      const currentRoomId =
+        userRoomIndex.get(ctx.user.id) || (await getUserRoom(ctx.user.id));
+      if (currentRoomId) await removeUserFromRoom(ctx.user.id);
+      const room = await createRoom({
         owner: {
           id: ctx.user.id,
           username: ctx.user.username,
           socketId: socket.id,
-          ipHash: ctx.ipHash,
-          fingerprint: ctx.fingerprint,
-          walletAddress: ctx.user.walletAddress,
         },
         cardCode: payload.cardCode,
         name: payload.name,
@@ -434,127 +651,190 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('room:join', ({ roomId }, ack = () => {}) => {
+  socket.on('room:join', async ({ roomId }, ack = () => {}) => {
     try {
-      const room = joinRoom(roomId, { user: ctx.user, socket, ipHash: ctx.ipHash, fingerprint: ctx.fingerprint });
+      await checkRateLimit('room-join', ctx.user.id, 40, 60 * 1000);
+      const room = await joinRoom(roomId, { user: ctx.user, socket });
       ack({ ok: true, roomId: room.id });
     } catch (error) {
       ack({ ok: false, error: error.message });
     }
   });
 
-  socket.on('room:leave', (_payload, ack = () => {}) => {
-    removeUserFromRoom(ctx.user.id);
+  socket.on('room:leave', async (_payload, ack = () => {}) => {
+    await removeUserFromRoom(ctx.user.id);
     ack({ ok: true });
   });
 
-  socket.on('room:ready', ({ ready }, ack = () => {}) => {
+  socket.on('room:ready', async ({ ready }, ack = () => {}) => {
     const roomId = userRoomIndex.get(ctx.user.id);
     const room = roomId ? rooms.get(roomId) : null;
-    if (!room) return ack({ ok: false, error: '방에 없습니다.' });
+    if (!room) return ack({ ok: false, error: 'room not found' });
     const player = room.players.find((p) => p.id === ctx.user.id);
-    if (!player) return ack({ ok: false, error: '플레이어를 찾을 수 없습니다.' });
+    if (!player) return ack({ ok: false, error: 'player not found' });
     player.ready = !!ready;
-    emitRoom(room);
+    await emitRoom(room);
     ack({ ok: true });
   });
 
-  socket.on('room:select-card', ({ cardCode }, ack = () => {}) => {
+  socket.on('room:select-card', async ({ cardCode }, ack = () => {}) => {
     const roomId = userRoomIndex.get(ctx.user.id);
     const room = roomId ? rooms.get(roomId) : null;
-    if (!room) return ack({ ok: false, error: '방이 없습니다.' });
-    if (room.hostId !== ctx.user.id) return ack({ ok: false, error: '방장만 변경할 수 있습니다.' });
-    if (room.status !== 'waiting') return ack({ ok: false, error: '대기 중인 방만 변경할 수 있습니다.' });
+    if (!room) return ack({ ok: false, error: 'room not found' });
+    if (room.hostId !== ctx.user.id) return ack({ ok: false, error: 'host only' });
+    if (room.status !== 'waiting') return ack({ ok: false, error: 'room must be waiting' });
     room.cardCode = findGame(cardCode).code;
-    emitRoom(room);
+    await emitRoom(room);
     ack({ ok: true });
   });
 
-  socket.on('room:fill-bots', ({ count }, ack = () => {}) => {
+  socket.on('room:fill-bots', async ({ count }, ack = () => {}) => {
     const roomId = userRoomIndex.get(ctx.user.id);
     const room = roomId ? rooms.get(roomId) : null;
-    if (!room) return ack({ ok: false, error: '방이 없습니다.' });
-    if (ctx.user.role !== 'admin') return ack({ ok: false, error: '어드민만 가능합니다.' });
+    if (!room) return ack({ ok: false, error: 'room not found' });
+    if (ctx.user.role !== 'admin') return ack({ ok: false, error: 'admin only' });
     fillBots(room, clampBots(count, room.cardCode));
-    emitRoom(room);
+    await emitRoom(room);
     ack({ ok: true });
   });
 
-  socket.on('room:start', (_payload, ack = () => {}) => {
+  socket.on('room:start', async (_payload, ack = () => {}) => {
     const roomId = userRoomIndex.get(ctx.user.id);
     const room = roomId ? rooms.get(roomId) : null;
-    if (!room) return ack({ ok: false, error: '방이 없습니다.' });
+    if (!room) return ack({ ok: false, error: 'room not found' });
     const problem = canStartRoom(room, ctx.user.id);
     if (problem) return ack({ ok: false, error: problem });
-    startRoom(room);
+    await startRoom(room);
     ack({ ok: true });
   });
 
-  socket.on('room:chat', ({ text }, ack = () => {}) => {
+  socket.on('room:chat', async ({ text }, ack = () => {}) => {
+    try {
+      await checkRateLimit('chat', ctx.user.id, 40, 60 * 1000);
+      const roomId = userRoomIndex.get(ctx.user.id);
+      const room = roomId ? rooms.get(roomId) : null;
+      if (!room) return ack({ ok: false, error: 'room not found' });
+      const trimmed = String(text || '').trim();
+      if (!trimmed) return ack({ ok: false, error: 'message is empty' });
+      if (room.session && !room.session.chatEnabled) {
+        return ack({ ok: false, error: 'chat is disabled for this phase' });
+      }
+      room.chat.push({
+        id: createId('msg'),
+        user: ctx.user.username,
+        userId: ctx.user.id,
+        text: trimmed.slice(0, 400),
+        at: now(),
+      });
+      await emitRoom(room);
+      ack({ ok: true });
+    } catch (error) {
+      ack({ ok: false, error: error.message });
+    }
+  });
+
+  socket.on('game:input', async (payload = {}, ack = () => {}) => {
+    try {
+      await checkRateLimit('game-input', ctx.user.id, 500, 60 * 1000);
+      const roomId = userRoomIndex.get(ctx.user.id);
+      const room = roomId ? rooms.get(roomId) : null;
+      if (!room || !room.session) return ack({ ok: false, error: 'no running game' });
+      submitInput(room.session, ctx.user.id, payload);
+      ack({ ok: true });
+    } catch (error) {
+      ack({ ok: false, error: error.message });
+    }
+  });
+
+  socket.on('game:submit', async (payload = {}, ack = () => {}) => {
+    try {
+      await checkRateLimit('game-submit', ctx.user.id, 80, 60 * 1000);
+      const roomId = userRoomIndex.get(ctx.user.id);
+      const room = roomId ? rooms.get(roomId) : null;
+      if (!room || !room.session) return ack({ ok: false, error: 'no running game' });
+      submit(room.session, ctx.user.id, payload);
+      autoSubmitBots(room.session);
+      await processRoomResult(room);
+      await emitRoom(room);
+      ack({ ok: true });
+    } catch (error) {
+      ack({ ok: false, error: error.message });
+    }
+  });
+
+  socket.on('game:admin-skip', async (_payload, ack = () => {}) => {
     const roomId = userRoomIndex.get(ctx.user.id);
     const room = roomId ? rooms.get(roomId) : null;
-    if (!room) return ack({ ok: false, error: '방이 없습니다.' });
-    const trimmed = String(text || '').trim();
-    if (!trimmed) return ack({ ok: false, error: '메시지가 비어 있습니다.' });
-    if (room.session && !room.session.chatEnabled) return ack({ ok: false, error: '현재 채팅이 비활성화되어 있습니다.' });
-    room.chat.push({ id: createId('msg'), user: ctx.user.username, userId: ctx.user.id, text: trimmed.slice(0, 400), at: now() });
-    emitRoom(room);
-    ack({ ok: true });
+    if (!room || !room.session) return ack({ ok: false, error: 'no running game' });
+    if (ctx.user.role !== 'admin') return ack({ ok: false, error: 'admin only' });
+    adminSkip(room.session);
+    autoSubmitBots(room.session);
+    await processRoomResult(room);
+    addSystemMessage(room, 'admin skipped current deadline');
+    await emitRoom(room);
+    return ack({ ok: true });
   });
 
-  socket.on('game:submit', (payload = {}, ack = () => {}) => {
-    const roomId = userRoomIndex.get(ctx.user.id);
-    const room = roomId ? rooms.get(roomId) : null;
-    if (!room || !room.session) return ack({ ok: false, error: '진행 중인 게임이 없습니다.' });
-    submit(room.session, ctx.user.id, payload);
-    emitRoom(room);
-    processRoomResult(room);
-    ack({ ok: true });
-  });
-
-  socket.on('disconnect', () => {
+  socket.on('disconnect', async () => {
     socketContext.delete(socket.id);
     const roomId = userRoomIndex.get(ctx.user.id);
     if (!roomId) return;
     const room = rooms.get(roomId);
     if (!room) return;
     updateRoomPlayerSocket(room, ctx.user.id, null, false);
-    emitRoom(room);
+    await emitRoom(room);
   });
 });
 
-function clampBots(count, cardCode) {
-  const game = findGame(cardCode);
-  const safe = Math.max(0, Math.min(parseInt(count, 10) || 0, game.players.max));
-  return safe;
-}
-
 setInterval(() => {
-  rooms.forEach((room) => {
-    if (room.session && room.session.status !== 'complete') {
+  io.emit('sync:clock', { serverNow: now(), recvAt: now() });
+}, 5000);
+
+setInterval(async () => {
+  if (ticking) return;
+  ticking = true;
+  try {
+    for (const room of rooms.values()) {
+      if (!room.session || room.session.status === 'complete') continue;
       const before = JSON.stringify({
-        phase: room.session.phase,
+        phaseId: room.session.phaseId,
         status: room.session.status,
-        result: room.session.result,
+        deadline: room.session.deadline,
         logLen: room.session.log.length,
+        subCount: Object.keys(room.session.submissions || {}).length,
       });
       tick(room.session);
-      processRoomResult(room);
+      autoSubmitBots(room.session);
+      await processRoomResult(room);
       const after = JSON.stringify({
-        phase: room.session.phase,
+        phaseId: room.session.phaseId,
         status: room.session.status,
-        result: room.session.result,
+        deadline: room.session.deadline,
         logLen: room.session.log.length,
+        subCount: Object.keys(room.session.submissions || {}).length,
       });
-      if (before !== after) emitRoom(room);
+      if (before !== after) {
+        await emitRoom(room);
+      }
     }
-  });
+  } finally {
+    ticking = false;
+  }
 }, 1000);
 
 app.get('*', (_req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-server.listen(PORT, () => {
-  console.log(`BORDERLAND webapp listening on http://localhost:${PORT}`);
+async function main() {
+  await storage.bootstrapAdmin();
+  initChainQueue({ withWorker: false });
+  server.listen(PORT, () => {
+    console.log(`BORDERLAND webapp listening on http://localhost:${PORT}`);
+  });
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
 });
